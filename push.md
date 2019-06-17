@@ -54,7 +54,31 @@ I'll get back to this in an example very shortly.
 
 The third and final point made more sense to me, I understood what the issue
 was with caching metrics: suddenly, metrics can go stale.
-Well, these issues don't seem like they are too bad, but I'll give you an example.
+
+The reasons we opted for Prometheus was that
+  * It is simple (simple enough at least to write our own exporters)
+  * It's written in Go and the application compiles to a single binary which
+    makes it nice to deploy. Plus we have Go developers on hand.
+  * It offers high resolution (per millisecond) of metrics
+  * Strong community, extremely important.
+
+Well, these issues don't seem like they are too bad, or so I thought. Let me
+show you why the Pushgateway being used as NAT circumvention is an anti-pattern.
+
+What's an anti-pattern? An anti-pattern is a bit tricky to understand if you
+don't really know what you're looking for (at least it took
+me until recently to *get* what it meant), but I will try my best to explain it.
+
+An anti-pattern is a solution. A bad solution, but a solution nontheless.
+What makes a solution bad? In my case, the solution of using Pushgateway to
+circumvent NAT + firewalling worked (as solutions should), but at the cost of
+insidious and hidden (at least it was to me) *technical debt* and blunting of my instruments.
+
+The reasons we opted for Prometheus, as I stated above were essentially:
+simplicity, accuracy and community, and this is how we lost those things.
+
+# Accuracy
+
 
 Enter **CUSTOMER MACHINE**. **CUSTOMER MACHINE** is running `node-exporter`.
 
@@ -62,7 +86,11 @@ Enter **CUSTOMER MACHINE**. **CUSTOMER MACHINE** is running `node-exporter`.
 `  sleep()` and GETs the `/metrics` endpoint on localhost, this takes `0.05`
    seconds total (`$ time curl localhost:9100/metrics`)
 
-2) At 1:00:0050pm we push to the Pushgateway, this takes about `0.35` seconds
+2) At 1:00:0050pm we push to the Pushgateway, this takes about `0.35` seconds.
+
+So stright away, we've lost our millisecond resolution. Now it's closer to half
+a second accuracy with *no* gurantee, we know what time the metrics reached the
+Pushgateway but not when they were created or how long they were in flight for.
 
 3) Enter **PROMETHEUS**, this turbo-chad of a program goes down its list of targets
    and finds the Pushgateway, in the same way the Bash script gets the `/metrics`
@@ -70,6 +98,13 @@ Enter **CUSTOMER MACHINE**. **CUSTOMER MACHINE** is running `node-exporter`.
    of `node-exporter`, **PROMETHEUS** GETs the `/metrics` endpoint and injests it
    into its time series database. **PROMETHEUS**, being an absolute king decides
    it will only pull once every 15 seconds.
+   
+Here we've lost our half-second resolution as we are only pulling every 15
+seconds. We could turn this up to scrape every second, but the script which is
+on each **CUSTOMER MACHINE** only pushes every 15 seconds also. If this were to
+be changed, We'd have to deploy a new version of the monitoring client package,
+as configuration management can't be used (customer requirement, I tried to make
+a case for it but was rebuffed).
 
 So our time series will look like:
 
@@ -118,6 +153,11 @@ is happening, and *when* these things are being reported isn't actually
 when they are being reported either. It's a good estimate, but our tools are
 less accurate.
 
+So now not only do we have only 15 seconds worth of resolution. We don't even
+know if the pulled metric is *fresh*, we need to rely on other metrics to
+determine the age of the pushed metric. More work, more complexity and most
+definetely a result of an anti-pattern.
+
 This is why the Prometheus authors do not suggest using the Pushgateway in this
 manner. While it is *alright* for general use cases, Prometheus is designed
 to be *fast* and accurate. The above design is anything but, it is (relatively)
@@ -147,3 +187,26 @@ We can never remove the inaccuracy that the Pushgateway adds.
 
 Once again, this is *fine* if you understand the limitations of the
 instruments you are using.
+
+But coming back to the reasons we chose Prometheus, this is no longer accurate,
+it's good enough, but it's not great. It's orders of magnitude slower than what
+is possible, and if we wanted to tweak it to scrape more frequently, it's a
+chore due to the customer's requirement of not using something like Ansible.
+
+It's much more complex, we have a script which curls the locally running
+exporters, PUTs it into the Pushgateway (which is far away from where the
+**CUSTOMER MACHINE** is, exporters are best when placed close to Prometheus). We
+have to use ugly PromQL to determine if a store is likely online. All of these
+issues cascade down from the anti-pattern.
+
+And finally, the community. How? Well since we are now running an exotic
+configuration, we are just that, exotic. Trying to find support for weird issues
+that might arise will be met with other people making the same mistakes. The
+developers of Prometheus are active and responsive to the community, if I were
+to go and ask them how to solve this issue with CPU rate spiking when the store 
+
+So what is the Pushgateway meant to be used for? Short lived jobs! Short lived
+being services that are ephemeral and do not lend themselves to scraping.
+
+Notice how I used service? There is a huge difference between a service and an
+instance. Many instances can create a service
